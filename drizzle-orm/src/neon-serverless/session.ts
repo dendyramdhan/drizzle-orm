@@ -261,21 +261,39 @@ export class NeonSession<
 		transaction: (tx: NeonTransaction<TFullSchema, TSchema>) => Promise<T>,
 		config: PgTransactionConfig = {},
 	): Promise<T> {
-		const session = this.client instanceof Pool // eslint-disable-line no-instanceof/no-instanceof
-			? new NeonSession(await this.client.connect(), this.dialect, this.schema, this.options)
+		const pool = this.client instanceof Pool // eslint-disable-line no-instanceof/no-instanceof
+			? this.client
+			: undefined;
+		const session = pool
+			? new NeonSession(await pool.connect(), this.dialect, this.schema, this.options)
 			: this;
 		const tx = new NeonTransaction<TFullSchema, TSchema>(this.dialect, session, this.schema);
-		await tx.execute(sql`begin ${tx.getTransactionConfigSQL(config)}`);
+		let began = false;
+		// Set only when BEGIN itself fails. Passed to release() so the pool
+		// discards the client instead of returning a connection whose session
+		// state is unknown.
+		let beginError: Error | undefined;
 		try {
+			await tx.execute(sql`begin ${tx.getTransactionConfigSQL(config)}`);
+			began = true;
 			const result = await transaction(tx);
 			await tx.execute(sql`commit`);
 			return result;
 		} catch (error) {
-			await tx.execute(sql`rollback`);
+			// Neon pipelines authentication with the first statement, so a wrong
+			// password arrives as a failed BEGIN. ROLLBACK on that connection can
+			// fail too and would replace the original error.
+			if (began) {
+				await tx.execute(sql`rollback`);
+			} else {
+				beginError = error as Error;
+			}
 			throw error;
 		} finally {
-			if (this.client instanceof Pool) { // eslint-disable-line no-instanceof/no-instanceof
-				(session.client as PoolClient).release();
+			if (pool) {
+				const client = session.client as PoolClient;
+				if (beginError) client.release(beginError);
+				else client.release();
 			}
 		}
 	}
