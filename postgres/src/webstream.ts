@@ -20,8 +20,11 @@ export async function negotiateSslRequest(readable: unknown, writable: unknown):
 	const reader = (readable as { getReader(): ByteReader }).getReader();
 	const writer = (writable as { getWriter(): ByteWriter }).getWriter();
 	try {
-		await writer.write(W.sslRequest());
-		const { value, done } = await reader.read();
+		// Post the read before the write settles. On workerd, an SSL reply that arrives in the
+		// same turn as the write is already parked; a read started only after write() resolves
+		// misses it and the following startTls() startup packet fails with "Network connection lost."
+		const reply = reader.read();
+		const [{ value, done }] = await Promise.all([reply, writer.write(W.sslRequest())]);
 		if (done || !value || value.byteLength === 0) {
 			throw new Error('@drizzle-team/postgres/cf: connection closed during the SSLRequest exchange');
 		}

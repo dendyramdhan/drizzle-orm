@@ -23,6 +23,52 @@ function fakeSocket(...replies: Uint8Array[]) {
 	return { readable, writable, written };
 }
 
+// The one-byte SSL reply is parked at the moment write() settles. A read posted only after that
+// misses it (workerd, two connects in one isolate — #6735). A read already pending receives 'S'.
+function sslReplyParkedWhenWriteSettles() {
+	let pendingRead: ((result: { value?: Uint8Array; done: boolean }) => void) | null = null;
+	let parked = false;
+	let readPendingWhenWriteSettled = false;
+	const written: Uint8Array[] = [];
+	const readable = {
+		getReader() {
+			return {
+				read(): Promise<{ value?: Uint8Array; done: boolean }> {
+					if (parked) return Promise.resolve({ done: true });
+					return new Promise((resolve) => {
+						pendingRead = resolve;
+					});
+				},
+				releaseLock() {},
+			};
+		},
+	};
+	const writable = {
+		getWriter() {
+			return {
+				write(chunk: Uint8Array): Promise<void> {
+					written.push(chunk);
+					parked = true;
+					readPendingWhenWriteSettled = pendingRead !== null;
+					if (pendingRead) {
+						const resolve = pendingRead;
+						pendingRead = null;
+						resolve({ value: new Uint8Array([0x53]), done: false });
+					}
+					return Promise.resolve();
+				},
+				releaseLock() {},
+			};
+		},
+	};
+	return {
+		readable,
+		writable,
+		written,
+		readPendingWhenWriteSettled: () => readPendingWhenWriteSettled,
+	};
+}
+
 describe('@drizzle-team/postgres/cf STARTTLS negotiation', () => {
 	test("sends the exact 8-byte SSLRequest and accepts a bare 'S'", async () => {
 		const s = fakeSocket(new Uint8Array([0x53]));
@@ -46,6 +92,13 @@ describe('@drizzle-team/postgres/cf STARTTLS negotiation', () => {
 		await expect(attempt(new Uint8Array([0x58]))).rejects.toThrow(/unexpected SSLRequest reply 0x58/);
 		await expect(attempt(new Uint8Array([0x53, 0x16]))).rejects.toThrow(/unexpected data after the SSLRequest reply/); // nothing may ride behind 'S'
 		await expect(attempt()).rejects.toThrow(/closed during the SSLRequest exchange/);
+	});
+
+	test("accepts an SSL reply already buffered when the SSLRequest write resolves", async () => {
+		const s = sslReplyParkedWhenWriteSettles();
+		await negotiateSslRequest(s.readable, s.writable);
+		expect(s.readPendingWhenWriteSettled()).toBe(true);
+		expect(s.written.length).toBe(1);
 	});
 });
 
